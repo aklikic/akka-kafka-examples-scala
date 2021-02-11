@@ -124,55 +124,27 @@ object SourceOps{
   implicit class KafkaSourceOps[A](source: Source[(Either[A,Error], CommittableOffset), NotUsed]) {
     val decider: Supervision.Decider = {
       case _: ExceptionWrapper => Supervision.Resume
-      case _                      => Supervision.Stop
+      case _ => Supervision.Stop
     }
-    def viaConditional[B](
-                            flow: Flow[(A, CommittableOffset), (Either[B,Error], CommittableOffset), NotUsed]
-                          ): Source[(Either[B,Error], CommittableOffset), NotUsed] = { //Source with Consumer.Control
 
-      val conditionalFlow:  Flow[(Either[A, Error], CommittableOffset), (A, CommittableOffset), NotUsed] =
+    def viaConditional[B](
+                           flow: Flow[(A, CommittableOffset), (Either[B, Error], CommittableOffset), NotUsed]
+                         ): Source[(Either[B, Error], CommittableOffset), NotUsed] = { //Source with Consumer.Control
+
+      val conditionalFlow: Flow[(Either[A, Error], CommittableOffset), (A, CommittableOffset), NotUsed] =
         Flow[(Either[A, Error], CommittableOffset)]
-        .map{
-          case (Right(error), committableOffset) => throw ExceptionWrapper(error,committableOffset)
-          case (Left(message), committableOffset) => (message,committableOffset)
-        }
+          .map {
+            case (Right(error), committableOffset) => throw ExceptionWrapper(error, committableOffset)
+            case (Left(message), committableOffset) => (message, committableOffset)
+          }
 
       source
         .via(conditionalFlow)
         .via(flow)
         .recover({
-          case ExceptionWrapper(error,context) => (Right(error),context)
+          case ExceptionWrapper(error, context) => (Right(error), context)
         }).withAttributes(ActorAttributes.supervisionStrategy(decider))
     }
-
-    private def graph2[O1, O2](
-                                outlet1: Flow[(immutable.Seq[O1], Committable), (Unit, Committable), _],
-                                outlet2: Flow[(immutable.Seq[O2], Committable), (Unit, Committable), _]
-                              ): Graph[akka.stream.FlowShape[(MultiData2[O1, O2], Committable), (Unit, Committable)], NotUsed] =
-      GraphDSL.create(outlet1, outlet2)((_, _) => NotUsed) { implicit builder: GraphDSL.Builder[NotUsed] => (o1, o2) =>
-        import GraphDSL.Implicits._
-
-        val spreadOut = builder.add(
-          Flow[(MultiData2[_ <: O1, _ <: O2], Committable)]
-            .map {
-              case (multi, committable) =>
-                ((multi.data1, committable), (multi.data2, committable))
-            }
-        )
-        val split = builder.add(Unzip[(immutable.Seq[O1], Committable), (immutable.Seq[O2], Committable)]())
-        val keepCommittable = builder.add(ZipWith[(_, Committable), (_, Committable), (Unit, Committable)]({
-          case ((_, committable), (_, _)) =>
-            ((), committable)
-
-        }))
-
-        // format: OFF
-        spreadOut ~> split.in
-        split.out0 ~> o1 ~> keepCommittable.in0
-        split.out1 ~> o2 ~> keepCommittable.in1
-        // format: ON
-        FlowShape(spreadOut.in, keepCommittable.out)
-      }
   }
 }
 
