@@ -1,4 +1,4 @@
-package operator
+package graph
 
 import java.util.concurrent.atomic.AtomicReference
 
@@ -7,8 +7,8 @@ import akka.kafka.ConsumerMessage.CommittableOffset
 import akka.kafka.scaladsl.{Committer, Consumer}
 import akka.kafka.{CommitterSettings, ConsumerSettings, Subscriptions}
 import akka.stream.ActorAttributes.SupervisionStrategy
-import akka.stream.scaladsl.{Flow, FlowWithContext, RestartSource, Sink, Source}
-import akka.stream.{ActorAttributes, Materializer, RestartSettings, Supervision}
+import akka.stream.scaladsl.{Broadcast, Flow, FlowWithContext, GraphDSL, Merge, RestartSource, Sink, Source, Unzip, ZipWith}
+import akka.stream.{ActorAttributes, FlowShape, Graph, Materializer, RestartSettings, Supervision}
 import akka.{Done, NotUsed}
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.serialization.StringDeserializer
@@ -29,10 +29,10 @@ final case class BusinessLogicError(data: SerializationResult, message:String) e
 //final case class Error[T](data: T, context: CommittableOffset, message:String) extends ProcessingErrorWithContext(context,message)
 
 
-class ErrorHandlingWithCustomOperatorExample(bootstrapServers: String)(implicit system: ActorSystem[Nothing], materializer: Materializer, ec: ExecutionContext) {
+class ErrorHandlingWithCustomOperatorAndGraphExample(bootstrapServers: String)(implicit system: ActorSystem[Nothing], materializer: Materializer, ec: ExecutionContext) {
 
   import SourceOps._
-  val log = LoggerFactory.getLogger(classOf[ErrorHandlingWithCustomOperatorExample])
+  val log = LoggerFactory.getLogger(classOf[ErrorHandlingWithCustomOperatorAndGraphExample])
   val control = new AtomicReference[Consumer.Control](Consumer.NoopControl)
   val resetSettings =  RestartSettings(minBackoff = 3.seconds, maxBackoff = 30.seconds, randomFactor = 0.2)
 
@@ -44,25 +44,25 @@ class ErrorHandlingWithCustomOperatorExample(bootstrapServers: String)(implicit 
 
   private val committerSettings = CommitterSettings(system)
 
-  def businessLogicFlow: Flow[(SerializationResult, CommittableOffset), (Either[BusinessLogicResult,Error], CommittableOffset), NotUsed] =
-    Flow[(SerializationResult,CommittableOffset)]
+  def businessLogicFlow[C]: Flow[(SerializationResult, C), (Either[BusinessLogicResult,Error], C), NotUsed] =
+    Flow[(SerializationResult,C)]
       .mapAsync(1)(businessLogic(_))
 
 
-  def businessLogic(input: (SerializationResult,CommittableOffset)): Future[(Either[BusinessLogicResult,Error],CommittableOffset)] = Future(business(input))
-  def business(input: (SerializationResult,CommittableOffset)): (Either[BusinessLogicResult,Error],CommittableOffset) = {
+  def businessLogic[C](input: (SerializationResult,C)): Future[(Either[BusinessLogicResult,Error],C)] = Future(business(input))
+  def business[C](input: (SerializationResult,C)): (Either[BusinessLogicResult,Error],C) = {
     if(input._1.data == 4)
       (Right(BusinessLogicError(input._1,"Data is 4")),input._2)
     else
       (Left(BusinessLogicResult(input._1)),input._2)
   }
 
-  def serializeFlow: Flow[(String, CommittableOffset), (Either[SerializationResult,Error], CommittableOffset), NotUsed] =
-    Flow[(String,CommittableOffset)]
+  def serializeFlow[C]: Flow[(String, C), (Either[SerializationResult,Error], C), NotUsed] =
+    Flow[(String,C)]
       .mapAsync(1)(serializeLogic(_))
 
-  def serializeLogic(input: (String,CommittableOffset)): Future[(Either[SerializationResult,Error],CommittableOffset)] = Future(serialize(input))
-  def serialize(input: (String,CommittableOffset)): (Either[SerializationResult,Error],CommittableOffset) = {
+  def serializeLogic[C](input: (String,C)): Future[(Either[SerializationResult,Error],C)] = Future(serialize(input))
+  def serialize[C](input: (String,C)): (Either[SerializationResult,Error],C) = {
     try {
       (Left(SerializationResult(input._1.toInt)),input._2)
     }catch {
@@ -71,25 +71,25 @@ class ErrorHandlingWithCustomOperatorExample(bootstrapServers: String)(implicit 
   }
 
 
-  def successFlow: Flow[(BusinessLogicResult, CommittableOffset), (Either[NotUsed, Error],CommittableOffset),NotUsed]=
-    Flow[(BusinessLogicResult,CommittableOffset)]
+  def successFlow[C]: Flow[(BusinessLogicResult, C), (Either[NotUsed, Error],C),NotUsed]=
+    Flow[(BusinessLogicResult,C)]
       .map(result => {
         log.info("{} - SUCCESS",result._1.data.data)
         (Left(NotUsed),result._2)
       })
 
-  def ifErrorHandlingFlow[A]: Flow[(Either[A,Error],CommittableOffset), CommittableOffset, NotUsed] =
-    Flow[(Either[A,Error],CommittableOffset)]
+  def ifErrorHandlingFlow[A,C]: Flow[(Either[A,Error],C), C, NotUsed] =
+    Flow[(Either[A,Error],C)]
       .map{
-        case (Right(error: SerializationError),context:CommittableOffset) => {
+        case (Right(error: SerializationError),context:C) => {
           log.info("{} - ERROR (Serialization)",error.data)
           context
         }
-        case (Right(error: BusinessLogicError),context:CommittableOffset) => {
+        case (Right(error: BusinessLogicError),context:C) => {
           log.info("{} - ERROR (Business Logic)",error.data.data)
           context
         }
-        case (_,context:CommittableOffset) => context
+        case (_,context:C) => context
       }
 
 
@@ -120,31 +120,51 @@ class ErrorHandlingWithCustomOperatorExample(bootstrapServers: String)(implicit 
 
 object SourceOps{
 
-  //Extend Source with a divertingVia operation which diverts errors to an error sink
-  implicit class KafkaSourceOps[A](source: Source[(Either[A,Error], CommittableOffset), NotUsed]) {
-    val decider: Supervision.Decider = {
-      case _: ExceptionWrapper => Supervision.Resume
-      case _ => Supervision.Stop
-    }
+
+  implicit class KafkaSourceOps[A,E,C](source: Source[(Either[A,E], C), NotUsed]) {
 
     def viaConditional[B](
-                           flow: Flow[(A, CommittableOffset), (Either[B, Error], CommittableOffset), NotUsed]
-                         ): Source[(Either[B, Error], CommittableOffset), NotUsed] = { //Source with Consumer.Control
+         flow: Flow[(A, C), (Either[B, E], C), NotUsed]
+    ): Source[(Either[B, E], C), NotUsed] = {
 
-      val conditionalFlow: Flow[(Either[A, Error], CommittableOffset), (A, CommittableOffset), NotUsed] =
-        Flow[(Either[A, Error], CommittableOffset)]
+      val passThroughFlow =
+        Flow[(Either[A,E], C)]
+          .filter(_._1.isRight)
           .map {
-            case (Right(error), committableOffset) => throw ExceptionWrapper(error, committableOffset)
-            case (Left(message), committableOffset) => (message, committableOffset)
+            case (Right(e),context:C) => (Right(e),context)
           }
 
+      val graphFlow = Flow.fromGraph(graph(flow,passThroughFlow))
+
       source
-        .via(conditionalFlow)
-        .via(flow)
-        .recover({
-          case ExceptionWrapper(error, context) => (Right(error), context)
-        })//.withAttributes(ActorAttributes.supervisionStrategy(decider))
+        .via(graphFlow)
+
     }
+
+    private def graph[A, B, E, C](
+         handleFlow: Flow[(A, C), (Either[B, E], C), _],
+         passThrough: Flow [(Either[A, E], C), (Either[B, E], C), _]
+    ):Graph[akka.stream.FlowShape[(Either[A, E], C), (Either[B, E], C)], NotUsed] =
+      GraphDSL.create(handleFlow,passThrough)((_, _) => NotUsed){ implicit builder: GraphDSL.Builder[NotUsed] => (hf,ptf) =>
+        import GraphDSL.Implicits._
+
+        val broadcast = builder.add(Broadcast[(Either[A,E], C)](2))
+
+        val filterFlow: Flow [(Either[A, E], C), (A, C), NotUsed] =
+          Flow[(Either[A,E], C)]
+            .filter(_._1.isLeft)
+            .map {
+              case (Left(a),context:C) => (a,context)
+            }
+
+        val merge = builder.add(Merge[(Either[B, E], C)](2))
+
+        // format: OFF
+        broadcast.out(0) ~> filterFlow ~> hf  ~> merge
+        broadcast.out(1) ~> ptf ~> merge
+        // format: ON
+        FlowShape(broadcast.in, merge.out)
+      }
   }
 }
 

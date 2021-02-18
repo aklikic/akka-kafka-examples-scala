@@ -12,6 +12,7 @@ import akka.kafka.scaladsl.Producer
 import akka.stream.Materializer
 import akka.stream.scaladsl.{Keep, Source}
 import divertto.DivertToExample
+import graph.ErrorHandlingWithCustomOperatorAndGraphExample
 import operator.ErrorHandlingWithCustomOperatorExample
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.serialization.StringSerializer
@@ -48,7 +49,8 @@ class Main {
     //new DivertToExample(kafkaServer).start();
     //run recover example
     //new ErrorHandlingWithRecoverExample(kafkaServer).start()
-    new ErrorHandlingWithCustomOperatorExample(kafkaServer).start()
+    //new ErrorHandlingWithCustomOperatorExample(kafkaServer).start()
+    new ErrorHandlingWithCustomOperatorAndGraphExample(kafkaServer).start()
     new Generator(kafkaServer).start()
     Thread.sleep(60000)
 
@@ -64,8 +66,7 @@ class Generator(bootstrapServers: String)(implicit system: ActorSystem[Nothing],
 
   def start(): Future[Done] = {
 
-    Source(List("1","2","3","4","Wrong5","6","7"))
-    //Source(List("1","2","3","4","5","6","7"))
+    Source(List("1","2","3","4","Wrong5","6","7","8","9"))
       .throttle(1,interval)
       .map(msg => new ProducerRecord("topic","1",msg))
       .toMat(Producer.plainSink(kafkaProducerSettings))(Keep.both)
